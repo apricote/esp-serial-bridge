@@ -54,8 +54,11 @@ async fn main(spawner: Spawner) {
     spawner.spawn(esb::uart::task(uart_reader)).ok();
 
     // Dev: Send test data to UART
-    let uart_writer = esb::uart_dev::UartWriter::new(uart_tx);
-    spawner.spawn(esb::uart_dev::task(uart_writer)).ok();
+    #[cfg(feature = "dev-uart")]
+    {
+        let uart_writer = esb::uart_dev::UartWriter::new(uart_tx);
+        spawner.spawn(esb::uart_dev::task(uart_writer)).ok();
+    }
 
     // Read from pipe and write to cache
     let server_reader = esb::server::Reader::new(pipe_reader);
