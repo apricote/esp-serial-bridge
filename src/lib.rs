@@ -1,5 +1,6 @@
 #![no_std]
 #![feature(ascii_char)]
+#![feature(impl_trait_in_assoc_type)]
 
 pub const RINGBUFFER_SIZE: usize = 8 * 1024;
 
@@ -9,6 +10,7 @@ pub mod wifi {
     use esp_hal::peripherals::{RADIO_CLK, TIMG0, WIFI};
     use esp_hal::rng::Rng;
     use esp_println::println;
+    use esp_wifi::config::PowerSaveMode;
     use esp_wifi::wifi::{
         ClientConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiStaDevice,
         WifiState,
@@ -43,8 +45,11 @@ pub mod wifi {
             esp_wifi::init(timer1.timer0, rng.clone(), radio_clk).unwrap()
         );
 
-        let (interface, controller) =
+        let (interface, mut controller) =
             esp_wifi::wifi::new_with_mode(&wifi_init, wifi, WifiStaDevice).unwrap();
+
+        // MCU does not respond to ARP requests when in power save mode :(
+        controller.set_power_saving(PowerSaveMode::None).unwrap();
 
         let dhcp_config = embassy_net::Config::dhcpv4(Default::default());
 
@@ -53,7 +58,7 @@ pub mod wifi {
         let (stack, runner) = embassy_net::new(
             interface,
             dhcp_config,
-            mk_static!(StackResources<3>, StackResources::<3>::new()),
+            mk_static!(StackResources<7>, StackResources::new()),
             seed,
         );
 
@@ -103,24 +108,30 @@ pub mod wifi {
 }
 
 pub mod uart {
-
-    use crate::{ringbuffer::RingBuffer, RINGBUFFER_SIZE};
+    use crate::RINGBUFFER_SIZE;
+    use embassy_sync::pipe;
+    use esp_hal::sync::RawMutex;
     use esp_hal::{uart::UartRx, Async};
+
+    pub const UART_CONTROLLER_BUFFER_SIZE: usize = 128;
 
     pub struct UartReader<'a, const N: usize> {
         rx: UartRx<'a, Async>,
-        ring_buffer: RingBuffer<N>,
+        writer: pipe::Writer<'a, RawMutex, { 2 * UART_CONTROLLER_BUFFER_SIZE }>,
     }
 
     impl<'a, const N: usize> UartReader<'a, N> {
-        pub fn new(rx: UartRx<'a, Async>, ring_buffer: RingBuffer<N>) -> Self {
-            UartReader { rx, ring_buffer }
+        pub fn new(
+            rx: UartRx<'a, Async>,
+            writer: pipe::Writer<'a, RawMutex, { 2 * UART_CONTROLLER_BUFFER_SIZE }>,
+        ) -> Self {
+            UartReader { rx, writer }
         }
 
         pub async fn run(&mut self) {
             // UART Controller has 128 bytes of buffer on esp32-c6
             // https://www.espressif.com/sites/default/files/documentation/esp32-c6_technical_reference_manual_en.pdf#uart
-            let mut buf = [0u8; 128];
+            let mut buf = [0u8; UART_CONTROLLER_BUFFER_SIZE];
 
             loop {
                 match self.rx.read_async(&mut buf).await {
@@ -133,7 +144,7 @@ pub mod uart {
                                 .map(|chars| chars.as_str())
                                 .unwrap_or("UNPARSEABLE")
                         );
-                        self.ring_buffer.write(&buf[..n]).await;
+                        self.writer.write(&buf[..n]).await;
                     }
 
                     Err(e) => {
@@ -182,31 +193,129 @@ pub mod uart_dev {
 }
 
 pub mod server {
-    use crate::{ringbuffer::RingBuffer, RINGBUFFER_SIZE};
+    use crate::{ringbuffer::RingBuffer, uart::UART_CONTROLLER_BUFFER_SIZE, RINGBUFFER_SIZE};
+    use core::{
+        fmt::Display,
+        net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    };
+    use edge_http::io::server;
+    use edge_nal::TcpBind;
+    use embassy_net::Stack;
+    use embassy_sync::pipe;
+    use embassy_time::{Duration, Timer};
+    use embedded_io_async::{Read, Write};
+    use esp_hal::sync::RawMutex;
 
-    pub struct Server<'a, const N: usize> {
-        ring_buffer: RingBuffer<N>,
-        _phantom: core::marker::PhantomData<&'a ()>,
+    const SOCKET_ADDR: SocketAddr =
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 84), 80));
+
+    static RINGBUFFER: RingBuffer<RINGBUFFER_SIZE> = RingBuffer::<RINGBUFFER_SIZE>::new();
+
+    pub struct Reader<'a> {
+        reader: pipe::Reader<'a, RawMutex, { 2 * UART_CONTROLLER_BUFFER_SIZE }>,
     }
 
-    impl<'a, const N: usize> Server<'a, N> {
-        pub fn new(ring_buffer: RingBuffer<N>) -> Self {
-            Server {
-                ring_buffer,
-                _phantom: core::marker::PhantomData,
-            }
+    impl<'a> Reader<'a> {
+        pub fn new(
+            reader: pipe::Reader<'a, RawMutex, { 2 * UART_CONTROLLER_BUFFER_SIZE }>,
+        ) -> Self {
+            Reader { reader }
         }
 
-        pub async fn run(&mut self) {
+        pub async fn run(&self) {
+            let mut buf = [0u8; UART_CONTROLLER_BUFFER_SIZE];
             loop {
-                let data = self.ring_buffer.read_all().await;
-                log::info!("Received data: {:?}", data);
+                let n = self.reader.read(&mut buf).await;
+                RINGBUFFER.write(&buf[..n]).await;
             }
         }
     }
 
     #[embassy_executor::task]
-    pub async fn task(mut server: Server<'static, RINGBUFFER_SIZE>) {
+    pub async fn task_reader(reader: Reader<'static>) {
+        reader.run().await;
+    }
+
+    pub struct Server<'a> {
+        stack: Stack<'a>,
+    }
+
+    impl<'a> Server<'a> {
+        pub fn new(stack: Stack<'a>) -> Self {
+            Server { stack }
+        }
+
+        pub async fn run(&self) {
+            loop {
+                if self.stack.is_link_up() {
+                    break;
+                }
+                Timer::after(Duration::from_millis(500)).await;
+            }
+
+            log::info!("Waiting to get IP address...");
+            loop {
+                if let Some(config) = self.stack.config_v4() {
+                    log::info!("Got IP: {}", config.address);
+                    break;
+                }
+                Timer::after(Duration::from_millis(500)).await;
+            }
+
+            let mut server = server::DefaultServer::new();
+
+            log::info!("Starting server on {}", SOCKET_ADDR);
+
+            let buffers = edge_nal_embassy::TcpBuffers::<4, { 4 * 1024 }, { 4 * 1024 }>::new();
+
+            let tcp = edge_nal_embassy::Tcp::new(self.stack, &buffers);
+
+            let acceptor = tcp.bind(SOCKET_ADDR).await.unwrap();
+
+            server
+                .run(Some(5_000), acceptor, HttpHandler)
+                .await
+                .unwrap();
+        }
+    }
+
+    struct HttpHandler;
+
+    impl server::Handler for HttpHandler {
+        type Error<E>
+            = edge_http::io::Error<E>
+        where
+            E: core::fmt::Debug;
+
+        async fn handle<T, const N: usize>(
+            &self,
+            _task_id: impl Display + Copy,
+            conn: &mut server::Connection<'_, T, N>,
+        ) -> Result<(), Self::Error<T::Error>>
+        where
+            T: Read + Write,
+        {
+            log::debug!("Handling request");
+            let headers = conn.headers()?;
+
+            if headers.method != edge_http::Method::Get {
+                conn.initiate_response(405, Some("Method Not Allowed"), &[])
+                    .await?;
+            } else if headers.path != "/" {
+                conn.initiate_response(404, Some("Not Found"), &[]).await?;
+            } else {
+                conn.initiate_response(200, Some("OK"), &[("Content-Type", "text/plain")])
+                    .await?;
+
+                conn.write_all(b"Hello world!").await?;
+            }
+
+            Ok(())
+        }
+    }
+
+    #[embassy_executor::task]
+    pub async fn task_server(server: Server<'static>) {
         server.run().await;
     }
 }
@@ -218,7 +327,7 @@ pub mod ringbuffer {
     pub struct RingBuffer<const N: usize>(mutex::Mutex<RawMutex, ([u8; N], usize)>);
 
     impl<const N: usize> RingBuffer<N> {
-        pub fn new() -> Self {
+        pub const fn new() -> Self {
             RingBuffer(mutex::Mutex::new(([0u8; N], 0)))
         }
 
@@ -233,6 +342,8 @@ pub mod ringbuffer {
                 guard.1 += 1;
                 bytes_written += 1;
             }
+
+            log::debug!("ringbuffer at position {}", guard.1);
 
             bytes_written
         }
