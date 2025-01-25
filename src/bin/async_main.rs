@@ -3,16 +3,17 @@
 
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
+use esb;
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
+use esp_hal::uart::Uart;
+use esp_println::println;
 use log::info;
 
 extern crate alloc;
 
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) {
-    // generator version: 0.2.2
-
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
@@ -23,25 +24,47 @@ async fn main(spawner: Spawner) {
     let timer0 = esp_hal::timer::systimer::SystemTimer::new(peripherals.SYSTIMER);
     esp_hal_embassy::init(timer0.alarm0);
 
+    let rng = esp_hal::rng::Rng::new(peripherals.RNG);
+
     info!("Embassy initialized!");
 
-    let timer1 = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG0);
-    let wifi = esp_wifi::init(
-        timer1.timer0,
-        esp_hal::rng::Rng::new(peripherals.RNG),
+    let (wifi_controller, wifi_stack, wifi_runner) = esb::wifi::init(
+        peripherals.TIMG0,
         peripherals.RADIO_CLK,
-    )
-    .unwrap();
+        peripherals.WIFI,
+        rng.clone(),
+    );
 
-    wifi.wifi()
+    spawner.spawn(esb::wifi::connection(wifi_controller)).ok();
+    spawner.spawn(esb::wifi::net_task(wifi_runner)).ok();
 
-    // TODO: Spawn some tasks
-    let _ = spawner;
+    let ring_buffer = esb::ringbuffer::RingBuffer::<{ esb::RINGBUFFER_SIZE }>::new();
+
+    let (uart_rx, uart_tx) = Uart::new(peripherals.UART1, Default::default())
+        .unwrap()
+        .with_rx(peripherals.GPIO2)
+        .with_tx(peripherals.GPIO3)
+        .into_async()
+        .split();
+    let uart_reader = esb::uart::UartReader::new(uart_rx, ring_buffer);
+    let uart_writer = esb::uart_dev::UartWriter::new(uart_tx);
+
+    spawner.spawn(esb::uart::task(uart_reader)).ok();
+    spawner.spawn(esb::uart_dev::task(uart_writer)).ok();
 
     loop {
-        info!("Hello world!");
-        Timer::after(Duration::from_secs(1)).await;
+        if wifi_stack.is_link_up() {
+            break;
+        }
+        Timer::after(Duration::from_millis(500)).await;
     }
 
-    // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/v0.23.1/examples/src/bin
+    println!("Waiting to get IP address...");
+    loop {
+        if let Some(config) = wifi_stack.config_v4() {
+            println!("Got IP: {}", config.address);
+            break;
+        }
+        Timer::after(Duration::from_millis(500)).await;
+    }
 }

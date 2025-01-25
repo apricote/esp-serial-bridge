@@ -3,9 +3,16 @@ edition = "2021"
 name    = "esp-serial-bridge"
 version = "0.1.0"
 
+[lib]
+name = "esb"
+path = "src/lib.rs"
+
 [[bin]]
 name = "esp-serial-bridge"
 path = "./src/bin/async_main.rs"
+test = false
+doctest = false
+bench = false
 
 [dependencies]
 embassy-net = { version = "0.6.0", features = [
@@ -52,17 +59,25 @@ embassy-executor = { version = "0.7.0", features = ["task-arena-size-20480"] }
 embassy-time     = { version = "0.4.0", features = ["generic-queue-8"] }
 esp-hal-embassy  = { version = "0.6.0", features = ["esp32c6"] }
 static_cell      = { version = "2.1.0", features = ["nightly"] }
+embassy-sync = "0.6.2"
+edge-http = "0.5.0"
 
 [profile.dev]
 # Rust debug is too slow.
 # For debug builds always builds with some optimization
 opt-level = "s"
 
+[profile.dev.package.esp-wifi]
+opt-level = 3
+
 [profile.release]
 codegen-units    = 1     # LLVM can perform better optimizations using a single thread
-debug            = 2
+debug            = true
 debug-assertions = false
 incremental      = false
 lto              = 'fat'
 opt-level        = 's'
 overflow-checks  = false
+
+[profile.release.package.esp-wifi]
+opt-level = 3
