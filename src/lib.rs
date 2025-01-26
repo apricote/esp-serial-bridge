@@ -2,7 +2,7 @@
 #![feature(ascii_char)]
 #![feature(impl_trait_in_assoc_type)]
 
-pub const RINGBUFFER_SIZE: usize = 8 * 1024;
+pub const RINGBUFFER_SIZE: usize = 4 * 1024;
 
 pub mod wifi {
     use embassy_net::{Runner, Stack, StackResources};
@@ -110,42 +110,53 @@ pub mod wifi {
 pub mod uart {
     use crate::RINGBUFFER_SIZE;
     use embassy_sync::pipe;
-    use embedded_io_async::Write;
+    use embassy_time::Instant;
     use esp_hal::sync::RawMutex;
     use esp_hal::{uart::UartRx, Async};
 
     pub const UART_CONTROLLER_BUFFER_SIZE: usize = 128;
+    pub const PIPE_SIZE: usize = 16 * UART_CONTROLLER_BUFFER_SIZE;
 
     pub struct UartReader<'a, const N: usize> {
         rx: UartRx<'a, Async>,
-        writer: pipe::Writer<'a, RawMutex, { 2 * UART_CONTROLLER_BUFFER_SIZE }>,
+        writer: pipe::Writer<'a, RawMutex, PIPE_SIZE>,
     }
 
     impl<'a, const N: usize> UartReader<'a, N> {
-        pub fn new(
-            rx: UartRx<'a, Async>,
-            writer: pipe::Writer<'a, RawMutex, { 2 * UART_CONTROLLER_BUFFER_SIZE }>,
-        ) -> Self {
+        pub fn new(rx: UartRx<'a, Async>, writer: pipe::Writer<'a, RawMutex, PIPE_SIZE>) -> Self {
             UartReader { rx, writer }
         }
 
         pub async fn run(&mut self) {
             // UART Controller has 128 bytes of buffer on esp32-c6
             // https://www.espressif.com/sites/default/files/documentation/esp32-c6_technical_reference_manual_en.pdf#uart
-            let mut buf = [0u8; UART_CONTROLLER_BUFFER_SIZE];
+            let mut buf = [0u8; 1 * UART_CONTROLLER_BUFFER_SIZE];
+
+            let mut loop_start: Instant = Instant::now();
+            let mut loop_received: Instant = Instant::now();
 
             loop {
+                let now = Instant::now();
+                log::info!(
+                    "Loop Duration Full={} SinceReceive={}",
+                    now.duration_since(loop_start).as_millis(),
+                    now.duration_since(loop_received).as_millis()
+                );
+                loop_start = now;
+
                 match self.rx.read_async(&mut buf).await {
                     Ok(n) => {
-                        log::info!(
-                            "Read {} bytes from UART: {}",
-                            n,
-                            buf[..n]
-                                .as_ascii()
-                                .map(|chars| chars.as_str())
-                                .unwrap_or("UNPARSEABLE")
-                        );
-                        self.writer.write_all(&buf[..n]).await.unwrap();
+                        loop_received = Instant::now();
+                        log::debug!("Read {} bytes from UART", n,);
+                        // self.writer.write_all(&buf[..n]).await.unwrap();
+                        match self.writer.try_write(&buf[..n]) {
+                            Ok(_) => {
+                                log::debug!("Wrote to pipe");
+                            }
+                            Err(e) => {
+                                log::error!("Error writing to pipe: {:?}", e);
+                            }
+                        }
                     }
                     Err(e) => {
                         log::error!("Error reading from UART: {:?}", e);
@@ -205,7 +216,11 @@ pub mod uart_dev {
 }
 
 pub mod server {
-    use crate::{ringbuffer::RingBuffer, uart::UART_CONTROLLER_BUFFER_SIZE, RINGBUFFER_SIZE};
+    use crate::{
+        ringbuffer::RingBuffer,
+        uart::{self},
+        RINGBUFFER_SIZE,
+    };
     use core::{
         fmt::Display,
         net::{Ipv4Addr, SocketAddr, SocketAddrV4},
@@ -224,40 +239,39 @@ pub mod server {
     const SOCKET_ADDR: SocketAddr =
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 84), 80));
 
-    const TCP_SOCKETS: usize = 4;
+    const TCP_SOCKETS: usize = 2;
 
     static RINGBUFFER: RingBuffer<RINGBUFFER_SIZE> = RingBuffer::<RINGBUFFER_SIZE>::new();
     static PUBSUB: pubsub::PubSubChannel<
         RawMutex,
-        heapless::Vec<u8, UART_CONTROLLER_BUFFER_SIZE>,
-        2,
+        heapless::Vec<u8, { uart::UART_CONTROLLER_BUFFER_SIZE }>,
+        128,
         TCP_SOCKETS,
         1,
     > = pubsub::PubSubChannel::new();
 
     pub struct Reader<'a> {
-        reader: pipe::Reader<'a, RawMutex, { 2 * UART_CONTROLLER_BUFFER_SIZE }>,
+        reader: pipe::Reader<'a, RawMutex, { uart::PIPE_SIZE }>,
     }
 
     impl<'a> Reader<'a> {
-        pub fn new(
-            reader: pipe::Reader<'a, RawMutex, { 2 * UART_CONTROLLER_BUFFER_SIZE }>,
-        ) -> Self {
+        pub fn new(reader: pipe::Reader<'a, RawMutex, { uart::PIPE_SIZE }>) -> Self {
             Reader { reader }
         }
 
         pub async fn run(&self) {
-            let mut buf = [0u8; UART_CONTROLLER_BUFFER_SIZE];
+            let mut buf = [0u8; uart::UART_CONTROLLER_BUFFER_SIZE];
             let publisher = PUBSUB.publisher().unwrap();
 
             loop {
                 let n = self.reader.read(&mut buf).await;
-                let msg = heapless::Vec::<u8, UART_CONTROLLER_BUFFER_SIZE>::from_slice(&buf[..n])
-                    .unwrap();
-                log::info!(
-                    "Read {} bytes from pipe, publishing to ringbuffer & pubsub: {:?}",
+                let msg = heapless::Vec::<u8, { uart::UART_CONTROLLER_BUFFER_SIZE }>::from_slice(
+                    &buf[..n],
+                )
+                .unwrap();
+                log::debug!(
+                    "Read {} bytes from pipe, publishing to ringbuffer & pubsub",
                     n,
-                    msg
                 );
                 publisher.publish_immediate(msg);
                 RINGBUFFER.write(&buf[..n]).await;
@@ -284,7 +298,7 @@ pub mod server {
                 if self.stack.is_link_up() {
                     break;
                 }
-                Timer::after(Duration::from_millis(500)).await;
+                Timer::after(Duration::from_millis(100)).await;
             }
 
             log::info!("Waiting to get IP address...");
@@ -293,18 +307,15 @@ pub mod server {
                     log::info!("Got IP: {}", config.address);
                     break;
                 }
-                Timer::after(Duration::from_millis(500)).await;
+                Timer::after(Duration::from_millis(100)).await;
             }
 
             let mut server = server::DefaultServer::new();
 
             log::info!("Starting server on {}", SOCKET_ADDR);
 
-            let buffers = edge_nal_embassy::TcpBuffers::<
-                TCP_SOCKETS,
-                { TCP_SOCKETS * 1024 },
-                { TCP_SOCKETS * 1024 },
-            >::new();
+            let buffers =
+                edge_nal_embassy::TcpBuffers::<TCP_SOCKETS, { 16 * 1024 }, { 1 * 1024 }>::new();
 
             let tcp = edge_nal_embassy::Tcp::new(self.stack, &buffers);
 
@@ -353,20 +364,23 @@ pub mod server {
                 let mut sub = PUBSUB.subscriber().unwrap();
 
                 loop {
-                    let msg: heapless::Vec<u8, UART_CONTROLLER_BUFFER_SIZE> =
-                        match sub.next_message().await {
-                            WaitResult::Message(msg) => msg,
-                            WaitResult::Lagged(_) => {
-                                heapless::Vec::<u8, UART_CONTROLLER_BUFFER_SIZE>::from_slice(
-                                    "[UART-BRIDGE] Some messages were skipped\n".as_bytes(),
-                                )
-                                .unwrap()
-                            }
-                        };
+                    let msg: heapless::Vec<u8, { uart::UART_CONTROLLER_BUFFER_SIZE }> = match sub
+                        .next_message()
+                        .await
+                    {
+                        WaitResult::Message(msg) => msg,
+                        WaitResult::Lagged(n) => {
+                            log::info!("Skipped {} messages from pubsub", n);
+                            heapless::Vec::<u8, { uart::UART_CONTROLLER_BUFFER_SIZE }>::from_slice(
+                                "\n[UART-BRIDGE] Some messages were skipped\n".as_bytes(),
+                            )
+                            .unwrap()
+                        }
+                    };
 
                     conn.write_all(&msg).await?;
                     conn.flush().await?;
-                    log::info!("Send new chunk from pubsub");
+                    log::info!("Forwarded new chunk from pubsub to http response");
                 }
             }
 

@@ -5,6 +5,9 @@ runner = "espflash flash --monitor"
 ESP_LOG="INFO"
 
 ESP_WIFI_CONFIG_COUNTRY_CODE="DE"
+ESP_HAL_EMBASSY_CONFIG_TIMER_QUEUE="multiple-integrated"
+ESP_WIFI_CONFIG_TX_QUEUE_SIZE="8"
+ESP_WIFI_CONFIG_STATIC_TX_BUF_NUM="10"
 
 
 [build]
@@ -18,3 +21,5 @@ target = "riscv32imac-unknown-none-elf"
 
 [unstable]
 build-std = ["alloc", "core"]
+build-std-features = ["panic_immediate_abort"]
+

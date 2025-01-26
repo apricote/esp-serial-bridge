@@ -4,12 +4,12 @@
 
 use embassy_executor::Spawner;
 use embassy_sync::pipe;
-use esb;
-use esb::uart::UART_CONTROLLER_BUFFER_SIZE;
+use esb::{self, uart};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::sync::RawMutex;
 use esp_hal::uart::Uart;
+use esp_hal_embassy as _;
 
 extern crate alloc;
 
@@ -38,15 +38,19 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(esb::wifi::connection(wifi_controller)).ok();
     spawner.spawn(esb::wifi::net_task(wifi_runner)).ok();
+    let (uart_rx, _) = Uart::new(
+        peripherals.UART1,
+        esp_hal::uart::Config::default()
+            .with_rx_fifo_full_threshold(100)
+            .with_rx_timeout(1),
+    )
+    .unwrap()
+    .with_rx(peripherals.GPIO2)
+    .with_tx(peripherals.GPIO3)
+    .into_async()
+    .split();
 
-    let (uart_rx, uart_tx) = Uart::new(peripherals.UART1, Default::default())
-        .unwrap()
-        .with_rx(peripherals.GPIO2)
-        .with_tx(peripherals.GPIO3)
-        .into_async()
-        .split();
-
-    static mut PIPE: pipe::Pipe<RawMutex, { 2 * UART_CONTROLLER_BUFFER_SIZE }> = pipe::Pipe::new();
+    static mut PIPE: pipe::Pipe<RawMutex, { uart::PIPE_SIZE }> = pipe::Pipe::new();
     let (pipe_reader, pipe_writer) = unsafe { PIPE.split() };
 
     // Read from UART and write to pipe
