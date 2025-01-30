@@ -190,8 +190,9 @@ pub mod uart_dev {
         pub async fn run(&mut self) {
             let mut i = 0;
             loop {
-                i = (i + 1) % 5;
-                let mut message = String::<32>::from_str("Test Message").unwrap();
+                i = (i + 1) % 15;
+                let mut message =
+                    String::<64>::from_str("Test Message Test Message Test Message Test ").unwrap();
                 // Add "A" to the end of message i times
                 for _ in 0..i {
                     message.push('A').unwrap();
@@ -237,7 +238,7 @@ pub mod server {
     use esp_hal::sync::RawMutex;
 
     const SOCKET_ADDR: SocketAddr =
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 84), 80));
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 80));
 
     const TCP_SOCKETS: usize = 2;
 
